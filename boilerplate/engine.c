@@ -576,23 +576,166 @@ static void supervisor_signal_handler(int sig)
     }
 
     while (!supervisor_stop) {
-    int client_fd;
-    control_request_t req;
-    control_response_t resp;
-    ssize_t n;
-
-    client_fd = accept(ctx.server_fd, NULL, NULL);
-    if (client_fd < 0) {
-        if (errno == EINTR) {
-            if (supervisor_got_sigchld) {
-                while (waitpid(-1, NULL, WNOHANG) > 0)
-                    ;
-                supervisor_got_sigchld = 0;
+        int client_fd = accept(ctx.server_fd, NULL, NULL);
+        if (client_fd < 0) {
+            if (errno == EINTR) {
+                if (supervisor_got_sigchld) {
+                    while (waitpid(-1, NULL, WNOHANG) > 0)
+                        ;
+                    supervisor_got_sigchld = 0;
+                }
+                continue;
             }
+            perror("accept");
+            break;
+        }
+    
+        control_request_t req;
+        control_response_t resp;
+        memset(&req, 0, sizeof(req));
+        memset(&resp, 0, sizeof(resp));
+    
+        if (read(client_fd, &req, sizeof(req)) <= 0) {
+            close(client_fd);
             continue;
         }
-        perror("accept");
-        break;
+    
+        // ===================== CMD_START =====================
+        if (req.kind == CMD_START) {
+            int pipefd[2];
+    
+            if (pipe(pipefd) < 0) {
+                perror("pipe");
+                resp.status = 1;
+                snprintf(resp.message, sizeof(resp.message), "pipe failed");
+                goto send_resp;
+            }
+    
+            pid_t pid = fork();
+    
+            if (pid < 0) {
+                perror("fork");
+                resp.status = 1;
+                snprintf(resp.message, sizeof(resp.message), "fork failed");
+                goto send_resp;
+            }
+    
+            if (pid == 0) {
+                // CHILD
+                close(pipefd[0]);
+    
+                dup2(pipefd[1], STDOUT_FILENO);
+                dup2(pipefd[1], STDERR_FILENO);
+                close(pipefd[1]);
+    
+                execlp(req.command, req.command, (char *)NULL);
+                perror("exec");
+                exit(1);
+            }
+    
+            // PARENT
+            close(pipefd[1]);
+    
+            mkdir("logs", 0755);
+    
+            container_record_t *rec = malloc(sizeof(*rec));
+            memset(rec, 0, sizeof(*rec));
+    
+            strncpy(rec->id, req.container_id, CONTAINER_ID_LEN - 1);
+            rec->host_pid = pid;
+            rec->started_at = time(NULL);
+            rec->state = CONTAINER_RUNNING;
+    
+            snprintf(rec->log_path, sizeof(rec->log_path),
+                     "logs/%s.log", rec->id);
+    
+            pthread_mutex_lock(&ctx.metadata_lock);
+            rec->next = ctx.containers;
+            ctx.containers = rec;
+            pthread_mutex_unlock(&ctx.metadata_lock);
+    
+            // ===== LOGGING PROCESS =====
+            pid_t logger_pid = fork();
+            if (logger_pid == 0) {
+                FILE *fp = fopen(rec->log_path, "a");
+                if (!fp) exit(1);
+    
+                char buffer[1024];
+                ssize_t n;
+    
+                while ((n = read(pipefd[0], buffer, sizeof(buffer))) > 0) {
+                    fwrite(buffer, 1, n, fp);
+                    fflush(fp);
+                }
+    
+                fclose(fp);
+                close(pipefd[0]);
+                exit(0);
+            }
+    
+            close(pipefd[0]);
+    
+            resp.status = 0;
+            snprintf(resp.message, sizeof(resp.message),
+                     "Started container %s (pid %d)", rec->id, pid);
+        }
+    
+        // ===================== CMD_LOGS =====================
+        else if (req.kind == CMD_LOGS) {
+            char path[PATH_MAX];
+            FILE *fp;
+            char buf[256];
+    
+            snprintf(path, sizeof(path), "logs/%s.log", req.container_id);
+    
+            fp = fopen(path, "r");
+            if (!fp) {
+                resp.status = 1;
+                snprintf(resp.message, sizeof(resp.message),
+                         "No logs for %s", req.container_id);
+            } else {
+                printf("=== Logs for %s ===\n", req.container_id);
+                while (fgets(buf, sizeof(buf), fp)) {
+                    printf("%s", buf);
+                }
+                fclose(fp);
+    
+                resp.status = 0;
+                snprintf(resp.message, sizeof(resp.message),
+                         "logs shown");
+            }
+        }
+    
+        // ===================== CMD_PS (simple) =====================
+        else if (req.kind == CMD_PS) {
+            pthread_mutex_lock(&ctx.metadata_lock);
+            container_record_t *cur = ctx.containers;
+    
+            printf("ID\tPID\tSTATE\n");
+            while (cur) {
+                printf("%s\t%d\t%s\n",
+                       cur->id,
+                       cur->host_pid,
+                       state_to_string(cur->state));
+                cur = cur->next;
+            }
+    
+            pthread_mutex_unlock(&ctx.metadata_lock);
+    
+            resp.status = 0;
+            snprintf(resp.message, sizeof(resp.message), "ps done");
+        }
+    
+        // ===================== UNKNOWN =====================
+        else {
+            resp.status = 1;
+            snprintf(resp.message, sizeof(resp.message),
+                     "Unknown command");
+        }
+    
+    send_resp:
+        write(client_fd, &resp, sizeof(resp));
+        close(client_fd);
     }
 
     memset(&req, 0, sizeof(req));
