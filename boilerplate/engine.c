@@ -576,46 +576,137 @@ static void supervisor_signal_handler(int sig)
     }
 
     while (!supervisor_stop) {
-        int client_fd = accept(ctx.server_fd, NULL, NULL);
-        if (client_fd < 0) {
-            if (errno == EINTR) {
-                if (supervisor_got_sigchld) {
-                    while (waitpid(-1, NULL, WNOHANG) > 0)
-                        ;
-                    supervisor_got_sigchld = 0;
-                }
-                continue;
-            }
-            perror("accept");
-            break;
-        }
-        control_request_t req;
-        control_response_t resp;
-        ssize_t n;
+    int client_fd;
+    control_request_t req;
+    control_response_t resp;
+    ssize_t n;
 
-        /* Read request */
-        n = read(client_fd, &req, sizeof(req));
-        if (n <= 0) {
-            close(client_fd);
+    client_fd = accept(ctx.server_fd, NULL, NULL);
+    if (client_fd < 0) {
+        if (errno == EINTR) {
+            if (supervisor_got_sigchld) {
+                while (waitpid(-1, NULL, WNOHANG) > 0)
+                    ;
+                supervisor_got_sigchld = 0;
+            }
             continue;
         }
-
-        /* Debug print */
-        printf("Received command: %d for container %s\n",
-            req.kind, req.container_id);
-
-        /* Prepare response */
-        memset(&resp, 0, sizeof(resp));
-        resp.status = 0;
-
-        snprintf(resp.message, sizeof(resp.message),
-                "Command received: %d", req.kind);
-
-        /* Send response */
-        write(client_fd, &resp, sizeof(resp));
-
-        close(client_fd);
+        perror("accept");
+        break;
     }
+
+    memset(&req, 0, sizeof(req));
+    memset(&resp, 0, sizeof(resp));
+
+    n = read(client_fd, &req, sizeof(req));
+    if (n != sizeof(req)) {
+        resp.status = 1;
+        snprintf(resp.message, sizeof(resp.message),
+                 "Invalid request");
+        if (write(client_fd, &resp, sizeof(resp)) < 0) {
+            perror("write");
+        }
+        close(client_fd);
+        continue;
+    }
+
+    // =========================
+    // HANDLE COMMANDS
+    // =========================
+    if (req.kind == CMD_START) {
+        pid_t pid = fork();
+
+        if (pid < 0) {
+            resp.status = 1;
+            snprintf(resp.message, sizeof(resp.message),
+                     "fork failed");
+        } else if (pid == 0) {
+            // CHILD
+            execlp(req.command, req.command, (char *)NULL);
+            perror("exec");
+            exit(1);
+        } else {
+            // PARENT
+            container_record_t *rec = malloc(sizeof(*rec));
+            if (!rec) {
+                resp.status = 1;
+                snprintf(resp.message, sizeof(resp.message),
+                         "malloc failed");
+            } else {
+                memset(rec, 0, sizeof(*rec));
+                strncpy(rec->id, req.container_id, CONTAINER_ID_LEN - 1);
+                rec->host_pid = pid;
+                rec->started_at = time(NULL);
+                rec->state = CONTAINER_RUNNING;
+
+                pthread_mutex_lock(&ctx.metadata_lock);
+                rec->next = ctx.containers;
+                ctx.containers = rec;
+                pthread_mutex_unlock(&ctx.metadata_lock);
+
+                resp.status = 0;
+                snprintf(resp.message, sizeof(resp.message),
+                         "Started container %s (pid %d)",
+                         rec->id, pid);
+            }
+        }
+    }
+
+    else if (req.kind == CMD_PS) {
+        pthread_mutex_lock(&ctx.metadata_lock);
+
+        container_record_t *cur = ctx.containers;
+        printf("ID\tPID\tSTATE\n");
+        while (cur) {
+            printf("%s\t%d\t%s\n",
+                   cur->id,
+                   cur->host_pid,
+                   state_to_string(cur->state));
+            cur = cur->next;
+        }
+
+        pthread_mutex_unlock(&ctx.metadata_lock);
+
+        resp.status = 0;
+        snprintf(resp.message, sizeof(resp.message),
+                 "ps done");
+    }
+
+    else if (req.kind == CMD_STOP) {
+        pthread_mutex_lock(&ctx.metadata_lock);
+
+        container_record_t *cur = ctx.containers;
+        while (cur) {
+            if (strcmp(cur->id, req.container_id) == 0) {
+                kill(cur->host_pid, SIGTERM);
+                cur->state = CONTAINER_STOPPED;
+                break;
+            }
+            cur = cur->next;
+        }
+
+        pthread_mutex_unlock(&ctx.metadata_lock);
+
+        resp.status = 0;
+        snprintf(resp.message, sizeof(resp.message),
+                 "Stopped %s", req.container_id);
+    }
+
+    else {
+        resp.status = 1;
+        snprintf(resp.message, sizeof(resp.message),
+                 "Unknown command");
+    }
+
+    // =========================
+    // SEND RESPONSE
+    // =========================
+    if (write(client_fd, &resp, sizeof(resp)) < 0) {
+        perror("write");
+    }
+
+    close(client_fd);
+}
  
 cleanup:
      bounded_buffer_begin_shutdown(&ctx.log_buffer);
