@@ -257,7 +257,7 @@ static DEFINE_MUTEX(monitored_lock);
 
         mutex_lock(&monitored_lock);
         list_for_each_entry_safe(entry, tmp, &monitored_list, list) {
-            if (entry->pid == req.pid ||
+            if (entry->pid == req.pid &&
                 strncmp(entry->container_id, req.container_id, MONITOR_NAME_LEN) == 0) {
                 list_del(&entry->list);
                 kfree(entry);

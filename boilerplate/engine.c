@@ -589,6 +589,31 @@ static void supervisor_signal_handler(int sig)
             perror("accept");
             break;
         }
+        control_request_t req;
+        control_response_t resp;
+        ssize_t n;
+
+        /* Read request */
+        n = read(client_fd, &req, sizeof(req));
+        if (n <= 0) {
+            close(client_fd);
+            continue;
+        }
+
+        /* Debug print */
+        printf("Received command: %d for container %s\n",
+            req.kind, req.container_id);
+
+        /* Prepare response */
+        memset(&resp, 0, sizeof(resp));
+        resp.status = 0;
+
+        snprintf(resp.message, sizeof(resp.message),
+                "Command received: %d", req.kind);
+
+        /* Send response */
+        write(client_fd, &resp, sizeof(resp));
+
         close(client_fd);
     }
  
