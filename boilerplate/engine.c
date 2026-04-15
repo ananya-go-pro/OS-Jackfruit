@@ -502,46 +502,39 @@ static void supervisor_signal_handler(int sig)
   *   - reap children and respond to signals
   */
  static int run_supervisor(const char *rootfs)
- {
-     supervisor_ctx_t ctx;
-     int rc;
+{
+    supervisor_ctx_t ctx;
+    int rc;
     struct sigaction sa;
- 
-     memset(&ctx, 0, sizeof(ctx));
-     ctx.server_fd = -1;
-     ctx.monitor_fd = -1;
- 
-     rc = pthread_mutex_init(&ctx.metadata_lock, NULL);
-     if (rc != 0) {
-         errno = rc;
-         perror("pthread_mutex_init");
-         return 1;
-     }
- 
-     rc = bounded_buffer_init(&ctx.log_buffer);
-     if (rc != 0) {
-         errno = rc;
-         perror("bounded_buffer_init");
-         pthread_mutex_destroy(&ctx.metadata_lock);
-         return 1;
-     }
- 
-     /*
-      * TODO:
-      *   1) open /dev/container_monitor
-      *   2) create the control socket / FIFO / shared-memory channel
-      *   3) install SIGCHLD / SIGINT / SIGTERM handling
-      *   4) spawn the logger thread
-      *   5) enter the supervisor event loop
-      */
-    (void)rootfs;
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.server_fd = -1;
+    ctx.monitor_fd = -1;
+
+    rc = pthread_mutex_init(&ctx.metadata_lock, NULL);
+    if (rc != 0) {
+        errno = rc;
+        perror("pthread_mutex_init");
+        return 1;
+    }
+
+    rc = bounded_buffer_init(&ctx.log_buffer);
+    if (rc != 0) {
+        errno = rc;
+        perror("bounded_buffer_init");
+        pthread_mutex_destroy(&ctx.metadata_lock);
+        return 1;
+    }
+
     supervisor_stop = 0;
     supervisor_got_sigchld = 0;
 
+    // Open monitor device
     ctx.monitor_fd = open("/dev/container_monitor", O_RDWR);
     if (ctx.monitor_fd < 0)
         perror("open /dev/container_monitor");
 
+    // Create UNIX socket
     ctx.server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (ctx.server_fd < 0) {
         perror("socket");
@@ -549,25 +542,28 @@ static void supervisor_signal_handler(int sig)
     }
 
     unlink(CONTROL_PATH);
-    {
-        struct sockaddr_un addr;
-        memset(&addr, 0, sizeof(addr));
-        addr.sun_family = AF_UNIX;
-        strncpy(addr.sun_path, CONTROL_PATH, sizeof(addr.sun_path) - 1);
-        if (bind(ctx.server_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
-            listen(ctx.server_fd, 16) != 0) {
-            perror("bind/listen");
-            goto cleanup;
-        }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, CONTROL_PATH, sizeof(addr.sun_path) - 1);
+
+    if (bind(ctx.server_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        listen(ctx.server_fd, 16) != 0) {
+        perror("bind/listen");
+        goto cleanup;
     }
 
+    // Signals
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = supervisor_signal_handler;
     sigemptyset(&sa.sa_mask);
+
     sigaction(SIGCHLD, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
+    // Logger thread
     rc = pthread_create(&ctx.logger_thread, NULL, logging_thread, &ctx);
     if (rc != 0) {
         errno = rc;
@@ -575,13 +571,16 @@ static void supervisor_signal_handler(int sig)
         goto cleanup;
     }
 
+    printf("Supervisor running...\n");
+
+    // MAIN LOOP
     while (!supervisor_stop) {
         int client_fd = accept(ctx.server_fd, NULL, NULL);
+
         if (client_fd < 0) {
             if (errno == EINTR) {
                 if (supervisor_got_sigchld) {
-                    while (waitpid(-1, NULL, WNOHANG) > 0)
-                        ;
+                    while (waitpid(-1, NULL, WNOHANG) > 0);
                     supervisor_got_sigchld = 0;
                 }
                 continue;
@@ -589,282 +588,39 @@ static void supervisor_signal_handler(int sig)
             perror("accept");
             break;
         }
-    
-        control_request_t req;
+
+        // TEMP: basic response so CLI doesn't break
         control_response_t resp;
-        memset(&req, 0, sizeof(req));
         memset(&resp, 0, sizeof(resp));
-    
-        if (read(client_fd, &req, sizeof(req)) <= 0) {
-            close(client_fd);
-            continue;
-        }
-    
-        // ===================== CMD_START =====================
-        if (req.kind == CMD_START) {
-            int pipefd[2];
-    
-            if (pipe(pipefd) < 0) {
-                perror("pipe");
-                resp.status = 1;
-                snprintf(resp.message, sizeof(resp.message), "pipe failed");
-                goto send_resp;
-            }
-    
-            pid_t pid = fork();
-    
-            if (pid < 0) {
-                perror("fork");
-                resp.status = 1;
-                snprintf(resp.message, sizeof(resp.message), "fork failed");
-                goto send_resp;
-            }
-    
-            if (pid == 0) {
-                // CHILD
-                close(pipefd[0]);
-    
-                dup2(pipefd[1], STDOUT_FILENO);
-                dup2(pipefd[1], STDERR_FILENO);
-                close(pipefd[1]);
-    
-                execlp(req.command, req.command, (char *)NULL);
-                perror("exec");
-                exit(1);
-            }
-    
-            // PARENT
-            close(pipefd[1]);
-    
-            mkdir("logs", 0755);
-    
-            container_record_t *rec = malloc(sizeof(*rec));
-            memset(rec, 0, sizeof(*rec));
-    
-            strncpy(rec->id, req.container_id, CONTAINER_ID_LEN - 1);
-            rec->host_pid = pid;
-            rec->started_at = time(NULL);
-            rec->state = CONTAINER_RUNNING;
-    
-            snprintf(rec->log_path, sizeof(rec->log_path),
-                     "logs/%s.log", rec->id);
-    
-            pthread_mutex_lock(&ctx.metadata_lock);
-            rec->next = ctx.containers;
-            ctx.containers = rec;
-            pthread_mutex_unlock(&ctx.metadata_lock);
-    
-            // ===== LOGGING PROCESS =====
-            pid_t logger_pid = fork();
-            if (logger_pid == 0) {
-                FILE *fp = fopen(rec->log_path, "a");
-                if (!fp) exit(1);
-    
-                char buffer[1024];
-                ssize_t n;
-    
-                while ((n = read(pipefd[0], buffer, sizeof(buffer))) > 0) {
-                    fwrite(buffer, 1, n, fp);
-                    fflush(fp);
-                }
-    
-                fclose(fp);
-                close(pipefd[0]);
-                exit(0);
-            }
-    
-            close(pipefd[0]);
-    
-            resp.status = 0;
-            snprintf(resp.message, sizeof(resp.message),
-                     "Started container %s (pid %d)", rec->id, pid);
-        }
-    
-        // ===================== CMD_LOGS =====================
-        else if (req.kind == CMD_LOGS) {
-            char path[PATH_MAX];
-            FILE *fp;
-            char buf[256];
-    
-            snprintf(path, sizeof(path), "logs/%s.log", req.container_id);
-    
-            fp = fopen(path, "r");
-            if (!fp) {
-                resp.status = 1;
-                snprintf(resp.message, sizeof(resp.message),
-                         "No logs for %s", req.container_id);
-            } else {
-                printf("=== Logs for %s ===\n", req.container_id);
-                while (fgets(buf, sizeof(buf), fp)) {
-                    printf("%s", buf);
-                }
-                fclose(fp);
-    
-                resp.status = 0;
-                snprintf(resp.message, sizeof(resp.message),
-                         "logs shown");
-            }
-        }
-    
-        // ===================== CMD_PS (simple) =====================
-        else if (req.kind == CMD_PS) {
-            pthread_mutex_lock(&ctx.metadata_lock);
-            container_record_t *cur = ctx.containers;
-    
-            printf("ID\tPID\tSTATE\n");
-            while (cur) {
-                printf("%s\t%d\t%s\n",
-                       cur->id,
-                       cur->host_pid,
-                       state_to_string(cur->state));
-                cur = cur->next;
-            }
-    
-            pthread_mutex_unlock(&ctx.metadata_lock);
-    
-            resp.status = 0;
-            snprintf(resp.message, sizeof(resp.message), "ps done");
-        }
-    
-        // ===================== UNKNOWN =====================
-        else {
-            resp.status = 1;
-            snprintf(resp.message, sizeof(resp.message),
-                     "Unknown command");
-        }
-    
-    send_resp:
+        resp.status = 0;
+        snprintf(resp.message, sizeof(resp.message),
+                 "Supervisor received request");
+
         write(client_fd, &resp, sizeof(resp));
         close(client_fd);
     }
 
-    memset(&req, 0, sizeof(req));
-    memset(&resp, 0, sizeof(resp));
-
-    n = read(client_fd, &req, sizeof(req));
-    if (n != sizeof(req)) {
-        resp.status = 1;
-        snprintf(resp.message, sizeof(resp.message),
-                 "Invalid request");
-        if (write(client_fd, &resp, sizeof(resp)) < 0) {
-            perror("write");
-        }
-        close(client_fd);
-        continue;
-    }
-
-    // =========================
-    // HANDLE COMMANDS
-    // =========================
-    if (req.kind == CMD_START) {
-        pid_t pid = fork();
-
-        if (pid < 0) {
-            resp.status = 1;
-            snprintf(resp.message, sizeof(resp.message),
-                     "fork failed");
-        } else if (pid == 0) {
-            // CHILD
-            execlp(req.command, req.command, (char *)NULL);
-            perror("exec");
-            exit(1);
-        } else {
-            // PARENT
-            container_record_t *rec = malloc(sizeof(*rec));
-            if (!rec) {
-                resp.status = 1;
-                snprintf(resp.message, sizeof(resp.message),
-                         "malloc failed");
-            } else {
-                memset(rec, 0, sizeof(*rec));
-                strncpy(rec->id, req.container_id, CONTAINER_ID_LEN - 1);
-                rec->host_pid = pid;
-                rec->started_at = time(NULL);
-                rec->state = CONTAINER_RUNNING;
-
-                pthread_mutex_lock(&ctx.metadata_lock);
-                rec->next = ctx.containers;
-                ctx.containers = rec;
-                pthread_mutex_unlock(&ctx.metadata_lock);
-
-                resp.status = 0;
-                snprintf(resp.message, sizeof(resp.message),
-                         "Started container %s (pid %d)",
-                         rec->id, pid);
-            }
-        }
-    }
-
-    else if (req.kind == CMD_PS) {
-        pthread_mutex_lock(&ctx.metadata_lock);
-
-        container_record_t *cur = ctx.containers;
-        printf("ID\tPID\tSTATE\n");
-        while (cur) {
-            printf("%s\t%d\t%s\n",
-                   cur->id,
-                   cur->host_pid,
-                   state_to_string(cur->state));
-            cur = cur->next;
-        }
-
-        pthread_mutex_unlock(&ctx.metadata_lock);
-
-        resp.status = 0;
-        snprintf(resp.message, sizeof(resp.message),
-                 "ps done");
-    }
-
-    else if (req.kind == CMD_STOP) {
-        pthread_mutex_lock(&ctx.metadata_lock);
-
-        container_record_t *cur = ctx.containers;
-        while (cur) {
-            if (strcmp(cur->id, req.container_id) == 0) {
-                kill(cur->host_pid, SIGTERM);
-                cur->state = CONTAINER_STOPPED;
-                break;
-            }
-            cur = cur->next;
-        }
-
-        pthread_mutex_unlock(&ctx.metadata_lock);
-
-        resp.status = 0;
-        snprintf(resp.message, sizeof(resp.message),
-                 "Stopped %s", req.container_id);
-    }
-
-    else {
-        resp.status = 1;
-        snprintf(resp.message, sizeof(resp.message),
-                 "Unknown command");
-    }
-
-    // =========================
-    // SEND RESPONSE
-    // =========================
-    if (write(client_fd, &resp, sizeof(resp)) < 0) {
-        perror("write");
-    }
-
-    close(client_fd);
-}
- 
 cleanup:
-     bounded_buffer_begin_shutdown(&ctx.log_buffer);
+    bounded_buffer_begin_shutdown(&ctx.log_buffer);
+
     if (ctx.logger_thread)
         pthread_join(ctx.logger_thread, NULL);
-     bounded_buffer_destroy(&ctx.log_buffer);
+
+    bounded_buffer_destroy(&ctx.log_buffer);
+
     if (ctx.server_fd >= 0)
         close(ctx.server_fd);
+
     unlink(CONTROL_PATH);
+
     if (ctx.monitor_fd >= 0)
         close(ctx.monitor_fd);
-     pthread_mutex_destroy(&ctx.metadata_lock);
+
+    pthread_mutex_destroy(&ctx.metadata_lock);
+
     return 0;
- }
- 
+}
+
  /*
   * TODO:
   * Implement the client-side control request path.
