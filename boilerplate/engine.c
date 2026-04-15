@@ -501,6 +501,15 @@ static void supervisor_signal_handler(int sig)
   *   - accept control requests and update container state
   *   - reap children and respond to signals
   */
+
+   /*
+     * TODO:
+     *   1) open /dev/container_monitor
+     *   2) create the control socket / FIFO / shared-memory channel
+     *   3) install SIGCHLD / SIGINT / SIGTERM handling
+     *   4) spawn the logger thread
+     *   5) enter the supervisor event loop
+     */
  static int run_supervisor(const char *rootfs)
 {
     supervisor_ctx_t ctx;
@@ -573,10 +582,9 @@ static void supervisor_signal_handler(int sig)
 
     printf("Supervisor running...\n");
 
-    // MAIN LOOP
     while (!supervisor_stop) {
         int client_fd = accept(ctx.server_fd, NULL, NULL);
-
+    
         if (client_fd < 0) {
             if (errno == EINTR) {
                 if (supervisor_got_sigchld) {
@@ -588,14 +596,80 @@ static void supervisor_signal_handler(int sig)
             perror("accept");
             break;
         }
-
-        // TEMP: basic response so CLI doesn't break
+    
+        control_request_t req;
         control_response_t resp;
+    
+        memset(&req, 0, sizeof(req));
         memset(&resp, 0, sizeof(resp));
-        resp.status = 0;
-        snprintf(resp.message, sizeof(resp.message),
-                 "Supervisor received request");
-
+    
+        if (read(client_fd, &req, sizeof(req)) <= 0) {
+            close(client_fd);
+            continue;
+        }
+    
+        /* =========================
+           HANDLE LOGS COMMAND
+           ========================= */
+        if (req.kind == CMD_LOGS) {
+            char path[PATH_MAX];
+            snprintf(path, sizeof(path), "%s/%s.log", LOG_DIR, req.container_id);
+    
+            FILE *fp = fopen(path, "r");
+            if (!fp) {
+                resp.status = 1;
+                snprintf(resp.message, sizeof(resp.message),
+                         "No logs for %s", req.container_id);
+            } else {
+                char buf[CONTROL_MESSAGE_LEN];
+                while (fgets(buf, sizeof(buf), fp)) {
+                    write(client_fd, buf, strlen(buf));
+                }
+                fclose(fp);
+                close(client_fd);
+                continue; // IMPORTANT: don't send resp after streaming
+            }
+        }
+    
+        /* =========================
+           HANDLE PS COMMAND
+           ========================= */
+        else if (req.kind == CMD_PS) {
+            char out[CONTROL_MESSAGE_LEN * 4] = {0};
+    
+            pthread_mutex_lock(&ctx.metadata_lock);
+    
+            container_record_t *cur = ctx.containers;
+            while (cur) {
+                char line[128];
+                snprintf(line, sizeof(line),
+                         "%s | pid=%d | %s\n",
+                         cur->id,
+                         cur->host_pid,
+                         state_to_string(cur->state));
+    
+                strncat(out, line, sizeof(out) - strlen(out) - 1);
+                cur = cur->next;
+            }
+    
+            pthread_mutex_unlock(&ctx.metadata_lock);
+    
+            if (out[0] == '\0')
+                strcpy(out, "No containers\n");
+    
+            resp.status = 0;
+            strncpy(resp.message, out, sizeof(resp.message) - 1);
+        }
+    
+        /* =========================
+           DEFAULT RESPONSE
+           ========================= */
+        else {
+            resp.status = 0;
+            snprintf(resp.message, sizeof(resp.message),
+                     "Command received (not fully implemented)");
+        }
+    
         write(client_fd, &resp, sizeof(resp));
         close(client_fd);
     }
