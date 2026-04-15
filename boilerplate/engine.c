@@ -34,6 +34,7 @@
  #include <sys/wait.h>
  #include <time.h>
  #include <unistd.h>
+ #include <sys/resource.h>
  
  #include "monitor_ioctl.h"
  
@@ -708,7 +709,11 @@ cleanup:
  
      memset(&req, 0, sizeof(req));
      req.kind = CMD_PS;
- 
+     /*
+      * TODO:
+      * The supervisor should respond with container metadata.
+      * Keep the rendering format simple enough for demos and debugging.
+      */
      return send_control_request(&req);
  }
  
